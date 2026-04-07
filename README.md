@@ -15,7 +15,7 @@ Drag your files in, let the LLM analyze them, and automatically save the results
 <img width="893" height="845" alt="Screen2" src="https://github.com/user-attachments/assets/8e9830b4-13cc-4952-8be8-4d0e2a7aa0d4" />
 
 ## Recommended models & Prompts
-For the best results with vision tasks, Qwen3-VL (or the latest Qwen3.5) is recommended, but you can choose any with visual support in LM studio.
+For the best results, Qwen3-VL or the latest Qwen3.5 is recommended, but you can choose any with visual-support in LM studio.
 
 ### Basic prompts for image captioning:
 Keyword tagging: 
@@ -35,5 +35,5 @@ For video analysis there is one basic prompt inside the script already that you 
 ## Requirements
 Python 3.10+
 ```bash
-pip install opencv-python Pillow piexif requests tkinterdnd2
+pip install opencv-python Pillow piexif requests tkinterdnd2-universal
 ```
