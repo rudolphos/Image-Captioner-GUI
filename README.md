@@ -35,5 +35,5 @@ For video analysis there is one basic prompt inside the script already that you 
 ## Requirements
 Python 3.10+
 ```bash
-pip install opencv-python Pillow piexif requests tkinterdnd2-universal
+pip install opencv-python Pillow piexif requests tkinterdnd2-universal numpy
 ```
