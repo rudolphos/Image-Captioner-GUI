@@ -1,7 +1,7 @@
 # Image-Captioner-GUI
 
-A lightweight GUI tool for batch-captioning media library using local vision models. 
-Drag your files in, let the LLM analyze them, and automatically save the results directly to the filenames or the metadata.
+A lightweight GUI tool for batch-captioning images and videos using local vision models. 
+Drag your files in, let the LLM analyze them, and it automatically saves the results directly to the filenames or the metadata.
 
 ## Features
 - Captions images (.jpg, .png) and videos (.mp4, .mkv, etc.).
