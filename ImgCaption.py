@@ -135,12 +135,12 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
         system = "You are a video summarizer. Always respond with a single short sentence. Never use bullet points or frame-by-frame descriptions."
         text   = (f"These {len(prepared.base64_data)} frames span {format_timestamp(info['duration'])} of video.\n"
                   f"Timestamps: {', '.join(frames)}\n\n"
-                  f"Write one concise sentence summarizing what happens in this video overall. "
+                  f"Write one concise sentence summarizing what happens in this video."
                   f"Focus on the main subject and action. DON'T describe frames individually.")
         content = [{"type": "text", "text": text}] + \
                   [{"type": "image_url", "image_url": {"url": d, "detail": "low"}}
                    for d in prepared.base64_data]
-        effective_max_tokens = max(max_tokens, 120)
+        effective_max_tokens = max(max_tokens, 90)
     else:
         system  = "/no_think"
         content = [{"type": "text", "text": prompt},
