@@ -50,6 +50,16 @@ def encode_image(source, max_size=1500):
         img.close()
     return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
 
+def is_good_frame(frame, blur_threshold=50.0, dark_threshold=20):
+    # Check darkness — mean pixel value across grayscale
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if gray.mean() < dark_threshold:
+        return False
+    # Check blur — laplacian variance
+    if cv2.Laplacian(gray, cv2.CV_64F).var() < blur_threshold:
+        return False
+    return True
+
 def extract_video_frames(path, num_frames=4, max_side=720):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
@@ -59,24 +69,36 @@ def extract_video_frames(path, num_frames=4, max_side=720):
     if frame_count <= 0:
         cap.release()
         return None, None, "Video has no frames"
-    duration   = frame_count / fps
-    timestamps = np.linspace(0, duration, num_frames, endpoint=False)
-    frames, actual_ts = [], []
-    for t in timestamps:
+    duration = frame_count / fps
+
+    # Sample a larger candidate pool, filter bad frames, pick evenly spaced survivors
+    candidates = np.linspace(0, duration, num_frames * 4, endpoint=False)
+    good_frames, good_ts = [], []
+    for t in candidates:
         cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
         ok, frame = cap.read()
         if not ok:
+            continue
+        if not is_good_frame(frame):
             continue
         h, w  = frame.shape[:2]
         scale = max_side / max(h, w)
         if scale < 1.0:
             frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-        frames.append(frame)
-        actual_ts.append(cap.get(cv2.CAP_PROP_POS_MSEC) / 1000)
+        good_frames.append(frame)
+        good_ts.append(cap.get(cv2.CAP_PROP_POS_MSEC) / 1000)
     cap.release()
-    if not frames:
-        return None, None, "Failed to extract frames"
-    return frames, {"duration": duration, "timestamps": actual_ts, "fps": fps}, None
+
+    if not good_frames:
+        return None, None, "No usable frames found"
+
+    # Evenly subsample down to num_frames if we have more
+    if len(good_frames) > num_frames:
+        indices = np.linspace(0, len(good_frames) - 1, num_frames, dtype=int)
+        good_frames = [good_frames[i] for i in indices]
+        good_ts     = [good_ts[i]     for i in indices]
+
+    return good_frames, {"duration": duration, "timestamps": good_ts, "fps": fps}, None
 
 def format_timestamp(s):
     h, m = int(s // 3600), int((s % 3600) // 60)
@@ -136,11 +158,12 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
         text   = (f"These {len(prepared.base64_data)} frames span {format_timestamp(info['duration'])} of video.\n"
                   f"Timestamps: {', '.join(frames)}\n\n"
                   f"Write one concise sentence summarizing what happens in this video."
-                  f"Focus on the main subject and action. DON'T describe frames individually.")
+                  f"Focus on the main subject and action. DON'T describe frames individually. "
+                  f"Use active voice. State actions directly and confidently. ")
         content = [{"type": "text", "text": text}] + \
                   [{"type": "image_url", "image_url": {"url": d, "detail": "low"}}
                    for d in prepared.base64_data]
-        effective_max_tokens = max(max_tokens, 90)
+        effective_max_tokens = max(max_tokens, 100)
     else:
         system  = "/no_think"
         content = [{"type": "text", "text": prompt},
