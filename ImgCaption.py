@@ -129,18 +129,18 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
         return None, "Failed to prepare image"
 
     is_video = isinstance(prepared.base64_data, list)
-    if is_video:
+    if is_video:                         # ← no attempt check here
         info   = prepared.video_info
         frames = [f"Frame {i+1} ({format_timestamp(t)})" for i, t in enumerate(info['timestamps'])]
-        system = "You are a video summarization AI. Always respond with a single short paragraph. Never use bullet points or frame-by-frame descriptions."
+        system = "You are a video summarizer. Always respond with a single short sentence. Never use bullet points or frame-by-frame descriptions."
         text   = (f"These {len(prepared.base64_data)} frames span {format_timestamp(info['duration'])} of video.\n"
                   f"Timestamps: {', '.join(frames)}\n\n"
-                  f"Write one concise paragraph summarizing what happens in this video overall. "
-                  f"Focus on the main subject and action. Do not describe frames individually.")
+                  f"Write one concise sentence summarizing what happens in this video overall. "
+                  f"Focus on the main subject and action. DON'T describe frames individually.")
         content = [{"type": "text", "text": text}] + \
                   [{"type": "image_url", "image_url": {"url": d, "detail": "low"}}
                    for d in prepared.base64_data]
-        effective_max_tokens = max(max_tokens, 120)  # override slider for video
+        effective_max_tokens = max(max_tokens, 120)
     else:
         system  = "/no_think"
         content = [{"type": "text", "text": prompt},
@@ -161,8 +161,10 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
     for attempt in range(max_retries + 1):
         resp = None
         try:
-            if attempt:
-                time.sleep(2)
+            if attempt == 0 and is_video:   # ← sleep lives here only
+                time.sleep(1.0)
+            elif attempt:
+                time.sleep(5 if is_video else 2)
             resp = session.post(api_url, json=payload, timeout=(10, 120))
             resp.raise_for_status()
             result = resp.json()
@@ -298,6 +300,8 @@ def process_files(file_paths, prompt, rename_mode, metadata_var, api_url,
         rename_errors = []
         in_q  = Queue()
         out_q = Queue(maxsize=MAX_CONCURRENT * 3)
+        has_video = any(fp.lower().endswith(VIDEO_EXTENSIONS) for fp in file_paths)
+        effective_concurrent = 1 if has_video else MAX_CONCURRENT
 
         prep_threads = [threading.Thread(target=preprocessing_worker, args=(in_q, out_q), daemon=True)
                         for _ in range(MAX_CONCURRENT)]
@@ -306,9 +310,9 @@ def process_files(file_paths, prompt, rename_mode, metadata_var, api_url,
         for _  in prep_threads: in_q.put(None)
 
         completed = 0
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as ex:
+        with ThreadPoolExecutor(max_workers=effective_concurrent) as ex:
             pending, submitted = {}, 0
-            for _ in range(min(MAX_CONCURRENT, total)):
+            for _ in range(min(effective_concurrent, total)):
                 p = out_q.get()
                 fut = ex.submit(generate_caption, p, prompt, api_url,
                                 token_var.get(), temperature_var.get(), top_p_var.get())
