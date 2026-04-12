@@ -132,27 +132,28 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
     if is_video:
         info   = prepared.video_info
         frames = [f"Frame {i+1} ({format_timestamp(t)})" for i, t in enumerate(info['timestamps'])]
-        system = ("You are a video analysis AI. Analyze the temporal progression across these frames. "
-                  "Use the provided timestamps to understand the speed and duration of actions. "
-                  "Describe the cause and effect sequence observed across the frames.")
-        text   = (f"Here are {len(prepared.base64_data)} frames from a video in sequential order.\n"
-                  f"Total Duration: {format_timestamp(info['duration'])}\n"
-                  f"Sequence: {', '.join(frames)}\n\nTask: {prompt}")
+        system = "You are a video summarization AI. Always respond with a single short paragraph. Never use bullet points or frame-by-frame descriptions."
+        text   = (f"These {len(prepared.base64_data)} frames span {format_timestamp(info['duration'])} of video.\n"
+                  f"Timestamps: {', '.join(frames)}\n\n"
+                  f"Write one concise paragraph summarizing what happens in this video overall. "
+                  f"Focus on the main subject and action. Do not describe frames individually.")
         content = [{"type": "text", "text": text}] + \
                   [{"type": "image_url", "image_url": {"url": d, "detail": "low"}}
                    for d in prepared.base64_data]
+        effective_max_tokens = max(max_tokens, 120)  # override slider for video
     else:
         system  = "/no_think"
         content = [{"type": "text", "text": prompt},
                    {"type": "image_url", "image_url": {"url": prepared.base64_data, "detail": "auto"}}]
+        effective_max_tokens = max_tokens
 
     payload = {
         "model": "local-model",
         "messages": [{"role": "system", "content": system},
                      {"role": "user",   "content": content}],
-        "temperature": temperature, 
+        "temperature": temperature,
         "top_p": top_p,
-        "max_tokens": max_tokens, 
+        "max_tokens": effective_max_tokens,  # ← use override
         "repeat_penalty": 1.1,
         "stream": False
     }
