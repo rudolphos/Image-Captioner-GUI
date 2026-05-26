@@ -174,6 +174,10 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
         "model": "local-model",
         "messages": [{"role": "system", "content": system},
                      {"role": "user",   "content": content}],
+        "extra_body": {
+            "enable_thinking": False,
+            "enable_search": False
+        },
         "temperature": temperature,
         "top_p": top_p,
         "max_tokens": effective_max_tokens,  # ← use override
@@ -474,13 +478,14 @@ prompt_text = scrolledtext.ScrolledText(prompt_frame, height=4)
 prompt_text.insert("1.0", DEFAULT_PROMPT)
 prompt_text.pack(fill="x")
 
+# Status bar first
+message_label = tk.Label(frame, text="Ready")
+message_label.pack(fill="x")
+
 # Result
 result_frame = tk.LabelFrame(frame, text="Last Generated Caption")
 result_frame.pack(fill="both", expand=True, pady=2)
 result_label = scrolledtext.ScrolledText(result_frame, state="disabled")
 result_label.pack(fill="both", expand=True)
-
-message_label = tk.Label(frame, text="Ready")
-message_label.pack(fill="x")
 
 root.mainloop()
