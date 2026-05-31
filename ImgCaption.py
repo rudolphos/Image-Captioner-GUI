@@ -151,18 +151,17 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
         return None, "Failed to prepare image"
 
     is_video = isinstance(prepared.base64_data, list)
-    if is_video:                         # ← no attempt check here
+    if is_video:
         info   = prepared.video_info
-        frames = [f"Frame {i+1} ({format_timestamp(t)})" for i, t in enumerate(info['timestamps'])]
-        system = "You are a video summarizer. Always respond with a single short sentence. Never use bullet points or frame-by-frame descriptions."
-        text   = (f"These {len(prepared.base64_data)} frames span {format_timestamp(info['duration'])} of video.\n"
-                  f"Timestamps: {', '.join(frames)}\n\n"
-                  f"Write one concise sentence summarizing what happens in this video."
-                  f"Focus on the main subject and action. DON'T describe frames individually. "
-                  f"Use active voice. State actions directly and confidently. ")
+        frames = [f"F{i+1}({format_timestamp(t)})" for i, t in enumerate(info['timestamps'])]
+        system = "You are a video tagging tool. Output only comma separated keywords."
+        text   = (f"Timestamps: {', '.join(frames)}\n\n"
+                    f"Output exactly 10 keywords summarizing main actions, subjects, settings in the video.\n"
+                    f"Format: tag1, tag2, tag3"
+                    f"Stop after 10.")
         content = [{"type": "text", "text": text}] + \
-                  [{"type": "image_url", "image_url": {"url": d, "detail": "low"}}
-                   for d in prepared.base64_data]
+                    [{"type": "image_url", "image_url": {"url": d, "detail": "high"}}
+                    for d in prepared.base64_data]
         effective_max_tokens = max(max_tokens, 100)
     else:
         system  = "/no_think"
@@ -432,7 +431,7 @@ api_url_entry.pack(fill="x")
 opt_frame = tk.LabelFrame(frame, text="Options & Generation Settings")
 opt_frame.pack(fill="x", pady=2)
 
-rename_mode  = tk.StringVar(value="append")
+rename_mode  = tk.StringVar(value="none")
 metadata_var = tk.BooleanVar(value=False)
 
 rename_row = tk.Frame(opt_frame)
