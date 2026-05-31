@@ -1,4 +1,5 @@
 import os
+from os import path
 import re
 import threading
 import base64
@@ -63,15 +64,16 @@ def is_good_frame(frame, blur_threshold=50.0, dark_threshold=20):
 def extract_video_frames(path, num_frames=4, max_side=720):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
-        return None, None, f"Cannot open video: {os.path.basename(path)}"
+        return None, None, f"Cannot open video container: {os.path.basename(path)}"
+        
     fps         = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if frame_count <= 0:
         cap.release()
-        return None, None, "Video has no frames"
+        return None, None, "Video file reports 0 frames."
     duration = frame_count / fps
 
-    # Sample a larger candidate pool, filter bad frames, pick evenly spaced survivors
+    # First Pass: Sample candidates with strict blur/darkness filters
     candidates = np.linspace(0, duration, num_frames * 4, endpoint=False)
     good_frames, good_ts = [], []
     for t in candidates:
@@ -87,12 +89,31 @@ def extract_video_frames(path, num_frames=4, max_side=720):
             frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
         good_frames.append(frame)
         good_ts.append(cap.get(cv2.CAP_PROP_POS_MSEC) / 1000)
+
+    # Second Pass: Fallback if everything was filtered out or seeking failed
+    if not good_frames:
+        good_frames, good_ts = [], []
+        # Calculate index intervals to step through sequentially (safest for VFR webm)
+        step = max(1, frame_count // num_frames)
+        for i in range(num_frames):
+            target_frame = i * step
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            h, w  = frame.shape[:2]
+            scale = max_side / max(h, w)
+            if scale < 1.0:
+                frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+            good_frames.append(frame)
+            good_ts.append(target_frame / fps)
+
     cap.release()
 
     if not good_frames:
-        return None, None, "No usable frames found"
+        return None, None, "Extraction engine failed to read any valid frame data"
 
-    # Evenly subsample down to num_frames if we have more
+    # Evenly subsample down to num_frames if we have extra
     if len(good_frames) > num_frames:
         indices = np.linspace(0, len(good_frames) - 1, num_frames, dtype=int)
         good_frames = [good_frames[i] for i in indices]
@@ -107,11 +128,12 @@ def format_timestamp(s):
 # ── PreparedImage ─────────────────────────────────────────────────────────────
 
 class PreparedImage:
-    __slots__ = ('file_path', 'base64_data', 'video_info')
-    def __init__(self, path, data, video_info=None):
+    __slots__ = ('file_path', 'base64_data', 'video_info', 'error_msg')
+    def __init__(self, path, data, video_info=None, error_msg=None):
         self.file_path  = path
         self.base64_data = data
         self.video_info  = video_info
+        self.error_msg   = error_msg
     def cleanup(self):
         self.base64_data = None
 
@@ -128,16 +150,17 @@ def preprocessing_worker(in_q, out_q):
             elif path.lower().endswith(VIDEO_EXTENSIONS):
                 frames, info, err = extract_video_frames(path)
                 if err:
-                    out_q.put(PreparedImage(path, None))
+                    out_q.put(PreparedImage(path, None, error_msg=err))
                 else:
                     b64_frames = []
                     for f in frames:
                         ok, buf = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 70])
                         if ok:
                             b64_frames.append(f"data:image/jpeg;base64,{base64.b64encode(buf).decode()}")
-                    out_q.put(PreparedImage(path, b64_frames, info))
-            else:
-                out_q.put(PreparedImage(path, None))
+                    if not b64_frames:
+                        out_q.put(PreparedImage(path, None, error_msg="Frame encoding failed"))
+                    else:
+                        out_q.put(PreparedImage(path, b64_frames, info))
         except Exception as e:
             print(f"Preprocessing error {path}: {e}")
             out_q.put(PreparedImage(path, None))
@@ -148,7 +171,7 @@ def preprocessing_worker(in_q, out_q):
 
 def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, max_retries=2):
     if not prepared.base64_data:
-        return None, "Failed to prepare image"
+        return None, getattr(prepared, 'error_msg', "Failed to prepare image")
 
     is_video = isinstance(prepared.base64_data, list)
     if is_video:
@@ -187,7 +210,7 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
     for attempt in range(max_retries + 1):
         resp = None
         try:
-            if attempt == 0 and is_video:   # ← sleep lives here only
+            if attempt == 0 and is_video:
                 time.sleep(1.0)
             elif attempt:
                 time.sleep(5 if is_video else 2)
