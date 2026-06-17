@@ -20,7 +20,7 @@ from typing import Optional, Any
 import numpy as np
 
 API_URL = "http://127.0.0.1:1234/v1/chat/completions"
-DEFAULT_PROMPT = "Output exactly 10 keywords describing the image. Comma separated. Stop after 10."
+DEFAULT_PROMPT = "Output exactly 10 keywords describing the image.\nComma separated. Stop after 10."
 MAX_CONCURRENT = 3
 
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.tiff', '.webp', '.bmp')
