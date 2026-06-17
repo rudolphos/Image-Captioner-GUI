@@ -15,6 +15,8 @@ import tkinter as tk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 from tkinter import messagebox, ttk, scrolledtext
 from io import BytesIO
+from dataclasses import dataclass
+from typing import Optional, Any
 import numpy as np
 
 API_URL = "http://127.0.0.1:1234/v1/chat/completions"
@@ -129,13 +131,13 @@ def format_timestamp(s):
 
 # ── PreparedImage ─────────────────────────────────────────────────────────────
 
+@dataclass
 class PreparedImage:
-    __slots__ = ('file_path', 'base64_data', 'video_info', 'error_msg')
-    def __init__(self, path, data, video_info=None, error_msg=None):
-        self.file_path  = path
-        self.base64_data = data
-        self.video_info  = video_info
-        self.error_msg   = error_msg
+    file_path: str
+    base64_data: Any
+    video_info: Optional[dict] = None
+    error_msg: Optional[str] = None
+
     def cleanup(self):
         self.base64_data = None
 
