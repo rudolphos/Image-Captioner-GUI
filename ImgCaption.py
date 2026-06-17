@@ -18,7 +18,7 @@ from io import BytesIO
 import numpy as np
 
 API_URL = "http://127.0.0.1:1234/v1/chat/completions"
-DEFAULT_PROMPT = "Output exactly 10 keywords describing this image. Comma separated. Stop after 10."
+DEFAULT_PROMPT = "Output exactly 10 keywords describing the image. Comma separated. Stop after 10."
 MAX_CONCURRENT = 3
 
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.tiff', '.webp', '.bmp')
@@ -83,10 +83,6 @@ def extract_video_frames(path, num_frames=4, max_side=720):
             continue
         if not is_good_frame(frame):
             continue
-        h, w  = frame.shape[:2]
-        scale = max_side / max(h, w)
-        if scale < 1.0:
-            frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
         good_frames.append(frame)
         good_ts.append(cap.get(cv2.CAP_PROP_POS_MSEC) / 1000)
 
@@ -101,10 +97,6 @@ def extract_video_frames(path, num_frames=4, max_side=720):
             ok, frame = cap.read()
             if not ok:
                 continue
-            h, w  = frame.shape[:2]
-            scale = max_side / max(h, w)
-            if scale < 1.0:
-                frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
             good_frames.append(frame)
             good_ts.append(target_frame / fps)
 
@@ -118,6 +110,16 @@ def extract_video_frames(path, num_frames=4, max_side=720):
         indices = np.linspace(0, len(good_frames) - 1, num_frames, dtype=int)
         good_frames = [good_frames[i] for i in indices]
         good_ts     = [good_ts[i]     for i in indices]
+
+    # Apply resizing only to the final selected frames
+    resized_frames = []
+    for frame in good_frames:
+        h, w  = frame.shape[:2]
+        scale = max_side / max(h, w)
+        if scale < 1.0:
+            frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        resized_frames.append(frame)
+    good_frames = resized_frames
 
     return good_frames, {"duration": duration, "timestamps": good_ts, "fps": fps}, None
 
@@ -167,7 +169,7 @@ def preprocessing_worker(in_q, out_q):
         finally:
             in_q.task_done()
 
-# ── Caption generation ────────────────────────────────────────────────────────
+# ── Caption generation
 
 def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, max_retries=2):
     if not prepared.base64_data:
@@ -175,17 +177,17 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
 
     is_video = isinstance(prepared.base64_data, list)
     if is_video:
-        info   = prepared.video_info
-        frames = [f"F{i+1}({format_timestamp(t)})" for i, t in enumerate(info['timestamps'])]
-        system = "You are a video tagging tool. Output only comma separated keywords."
-        text   = (f"Timestamps: {', '.join(frames)}\n\n"
-                    f"Output exactly 10 keywords summarizing main actions, subjects, settings in the video.\n"
-                    f"Format: tag1, tag2, tag3"
-                    f"Stop after 10.")
-        content = [{"type": "text", "text": text}] + \
+            info   = prepared.video_info
+            frames = [f"F{i+1}({format_timestamp(t)})" for i, t in enumerate(info['timestamps'])]
+            system = "You are a video tagging tool. Respond only with comma-separated keywords, nothing else."
+            text   = (f"These video frames were captured at: {', '.join(frames)}\n\n"
+                    "Analyze the frames and output exactly 10 keywords describing "
+                    "the main actions, subjects, and setting.\n"
+                    "Your output:")
+            content = [{"type": "text", "text": text}] + \
                     [{"type": "image_url", "image_url": {"url": d, "detail": "high"}}
                     for d in prepared.base64_data]
-        effective_max_tokens = max(max_tokens, 100)
+            effective_max_tokens = max(max_tokens, 100)
     else:
         system  = "/no_think"
         content = [{"type": "text", "text": prompt},
