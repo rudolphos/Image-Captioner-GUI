@@ -38,7 +38,7 @@ adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_CONCURRENT * 2,
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
-# ── Encoding ─────────────────────────────────────────────────────────────────
+# ── Encoding
 
 def encode_image(source, max_size=1500):
     img = Image.open(source) if isinstance(source, (str, os.PathLike)) else source
@@ -54,14 +54,8 @@ def encode_image(source, max_size=1500):
     return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
 
 def is_good_frame(frame, blur_threshold=50.0, dark_threshold=20):
-    # Check darkness — mean pixel value across grayscale
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    if gray.mean() < dark_threshold:
-        return False
-    # Check blur — laplacian variance
-    if cv2.Laplacian(gray, cv2.CV_64F).var() < blur_threshold:
-        return False
-    return True
+    return gray.mean() >= dark_threshold and cv2.Laplacian(gray, cv2.CV_64F).var() >= blur_threshold
 
 def extract_video_frames(path, num_frames=4, max_side=720):
     cap = cv2.VideoCapture(path)
@@ -129,9 +123,9 @@ def format_timestamp(s):
     h, m = int(s // 3600), int((s % 3600) // 60)
     return f"{h}:{m:02d}:{int(s%60):02d}" if h else f"{m}:{int(s%60):02d}"
 
-# ── PreparedImage ─────────────────────────────────────────────────────────────
+# ── PreparedImage
 
-@dataclass
+@dataclass(slots=True)
 class PreparedImage:
     file_path: str
     base64_data: Any
@@ -141,7 +135,7 @@ class PreparedImage:
     def cleanup(self):
         self.base64_data = None
 
-# ── Preprocessing pipeline ───────────────────────────────────────────────────
+# ── Preprocessing pipeline
 
 def preprocessing_worker(in_q, out_q):
     while True:
@@ -240,7 +234,7 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
             if resp:
                 resp.close()
 
-# ── File operations ───────────────────────────────────────────────────────────
+# ── File operations
 
 def clean_caption_for_filename(text, max_length):
     text = FILENAME_CLEAN.sub('', str(text)).strip()
@@ -308,29 +302,18 @@ def apply_metadata(path, caption):
     except Exception:
         pass
 
-# ── Drop path parsing ─────────────────────────────────────────────────────────
+# ── Drop path parsing 
 
 def parse_drop_paths(event):
     try:
         return list(event.widget.tk.splitlist(event.data))
     except Exception:
-        pass
-    data = (event.data or "").strip()
-    if '{' in data:
-        return re.findall(r'\{([^}]+)\}', data)
-    parts, paths, cur = data.split(' '), [], ''
-    for p in parts:
-        if re.match(r'^[A-Za-z]:[\\/]', p):
-            if cur:
-                paths.append(cur)
-            cur = p
-        else:
-            cur = f"{cur} {p}" if cur else p
-    if cur:
-        paths.append(cur)
-    return [p.strip() for p in paths if p.strip()]
+        data = (event.data or "").strip()
+        if '{' in data:
+            return re.findall(r'\{([^}]+)\}', data)
+        return [p.strip() for p in re.split(r'\s+(?=[A-Za-z]:[\\/])', data) if p.strip()]
 
-# ── Processing ────────────────────────────────────────────────────────────────
+# ── Processing───
 
 def process_files(file_paths, prompt, rename_mode, metadata_var, api_url,
                   message_label, result_label, progress_bar,
@@ -439,7 +422,7 @@ def on_drop(event):
                   message_label, result_label, progress_bar,
                   token_var, temperature_var, top_p_var)
 
-# ── GUI ───────────────────────────────────────────────────────────────────────
+#  GUI
 root = TkinterDnD.Tk()
 root.title("LM Studio Captioner")
 root.geometry("420x700")
