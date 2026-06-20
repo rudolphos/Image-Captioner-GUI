@@ -40,7 +40,7 @@ session.mount('https://', adapter)
 
 # ── Encoding
 
-def encode_image(source, max_size=1500):
+def encode_image(source, max_size=3000):
     img = Image.open(source) if isinstance(source, (str, os.PathLike)) else source
     if max(img.size) > max_size:
         r = max_size / max(img.size)
@@ -372,7 +372,7 @@ def process_files(file_paths, prompt, rename_mode, metadata_var, api_url,
                         submitted += 1
 
                     gui(lambda c=completed, n=os.path.basename(fp):
-                        message_label.config(text=f"Processing {c}/{total}: {n}"))
+                        message_label.config(text=f"Processing {c}/{total}\n{n}"))
                     gui(lambda v=completed: progress_bar.config(value=v))
 
                     if err or not caption:
@@ -452,7 +452,7 @@ for txt, val in [("Append", "append"), ("Replace", "replace"), ("None", "none")]
 tk.Checkbutton(opt_frame, text="Write metadata (PNG/JPG EXIF)", variable=metadata_var).pack(anchor="w")
 
 # Sliders
-token_var       = tk.IntVar(value=35)
+token_var       = tk.IntVar(value=32)
 temperature_var = tk.DoubleVar(value=0.4)
 top_p_var       = tk.DoubleVar(value=0.95)
 
