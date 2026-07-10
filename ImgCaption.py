@@ -22,6 +22,7 @@ import numpy as np
 API_URL = "http://127.0.0.1:1234/v1/chat/completions"
 DEFAULT_PROMPT = "Output exactly 10 keywords describing the image.\nComma separated. Stop after 10."
 MAX_CONCURRENT = 3
+MAX_IMAGE_SIZE = 3500
 
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.tiff', '.webp', '.bmp')
 VIDEO_EXTENSIONS = ('.mp4', '.webm', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.ts')
@@ -40,7 +41,7 @@ session.mount('https://', adapter)
 
 # ── Encoding
 
-def encode_image(source, max_size=3000):
+def encode_image(source, max_size=MAX_IMAGE_SIZE):
     img = Image.open(source) if isinstance(source, (str, os.PathLike)) else source
     if max(img.size) > max_size:
         r = max_size / max(img.size)
@@ -57,7 +58,7 @@ def is_good_frame(frame, blur_threshold=50.0, dark_threshold=20):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return gray.mean() >= dark_threshold and cv2.Laplacian(gray, cv2.CV_64F).var() >= blur_threshold
 
-def extract_video_frames(path, num_frames=4, max_side=720):
+def extract_video_frames(path, num_frames=4, max_side=960):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         return None, None, f"Cannot open video container: {os.path.basename(path)}"
@@ -144,7 +145,7 @@ def preprocessing_worker(in_q, out_q):
             break
         try:
             if path.lower().endswith(IMAGE_EXTENSIONS):
-                out_q.put(PreparedImage(path, encode_image(path, max_size=1024)))
+                out_q.put(PreparedImage(path, encode_image(path, max_size=MAX_IMAGE_SIZE)))
             elif path.lower().endswith(VIDEO_EXTENSIONS):
                 frames, info, err = extract_video_frames(path)
                 if err:
@@ -175,7 +176,7 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
     if is_video:
             info   = prepared.video_info
             frames = [f"F{i+1}({format_timestamp(t)})" for i, t in enumerate(info['timestamps'])]
-            system = "You are a video tagging tool. Respond only with comma-separated keywords, nothing else."
+            system = "You are a video tagging tool. Respond only with comma-separated keywords."
             text   = (f"These video frames were captured at: {', '.join(frames)}\n\n"
                     "Analyze the frames and output exactly 10 keywords describing "
                     "the main actions, subjects, and setting.\n"
@@ -187,20 +188,16 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
     else:
         system  = "/no_think"
         content = [{"type": "text", "text": prompt},
-                   {"type": "image_url", "image_url": {"url": prepared.base64_data, "detail": "auto"}}]
+                   {"type": "image_url", "image_url": {"url": prepared.base64_data, "detail": "high"}}]
         effective_max_tokens = max_tokens
 
     payload = {
         "model": "local-model",
         "messages": [{"role": "system", "content": system},
                      {"role": "user",   "content": content}],
-        "extra_body": {
-            "enable_thinking": False,
-            "enable_search": False
-        },
         "temperature": temperature,
         "top_p": top_p,
-        "max_tokens": effective_max_tokens,  # ← use override
+        "max_tokens": effective_max_tokens,
         "repeat_penalty": 1.1,
         "stream": False
     }
@@ -424,7 +421,7 @@ def on_drop(event):
 
 #  GUI
 root = TkinterDnD.Tk()
-root.title("LM Studio Captioner")
+root.title("LLM Visual Captioner")
 root.geometry("420x700")
 frame = tk.Frame(root)
 frame.pack(fill="both", expand=True, padx=5, pady=4)
@@ -464,7 +461,7 @@ for label, var, lo, hi, res in [
     row = tk.Frame(opt_frame)
     row.pack(fill="x")
     tk.Label(row, text=label, width=7, anchor="w").pack(side="left")
-    val_lbl = tk.Label(row, width=5, anchor="e", relief="sunken")
+    val_lbl = tk.Label(row, width=4, anchor="e", relief="sunken")
     val_lbl.pack(side="right", padx=(2, 4))
     var.trace_add("write", lambda *_, v=var, l=val_lbl: l.config(text=str(v.get())))
     val_lbl.config(text=str(var.get()))
