@@ -185,17 +185,19 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
 
     is_video = isinstance(prepared.base64_data, list)
     if is_video:
-            info   = prepared.video_info
-            frames = [f"F{i+1}({format_timestamp(t)})" for i, t in enumerate(info['timestamps'])]
-            system = "You are a video tagging tool. Respond only with comma-separated keywords."
-            text   = (f"These video frames were captured at: {', '.join(frames)}\n\n"
-                    "List 9 keywords for the main recurring subject, action, setting."
-                    "Prioritize what appears across multiple frames, but always include "
-                    "any readable on-screen text, titles, or names even if seen in only one frame.")
-            content = [{"type": "text", "text": text}] + \
-                    [{"type": "image_url", "image_url": {"url": d, "detail": "auto"}}
-                    for d in prepared.base64_data]
-            effective_max_tokens = max(max_tokens, 100)
+        info = prepared.video_info
+        system = "/no_think You are a video tagging tool. Respond only with comma-separated keywords."
+
+        content = [{"type": "text", "text": "You will see frames sampled from one short video, in order."}]
+        for i, (frame_data, ts) in enumerate(zip(prepared.base64_data, info['timestamps'])):
+            content.append({"type": "text", "text": f"Frame {i+1}, at {format_timestamp(ts)}:"})
+            content.append({"type": "image_url", "image_url": {"url": frame_data, "detail": "auto"}})
+        content.append({"type": "text", "text":
+            "List 9 keywords for the main recurring subject, action, setting. "
+            "Prioritize what appears across multiple frames, but always include "
+            "any readable on-screen text, titles, or names even if seen in only one frame."})
+        effective_max_tokens = max(max_tokens, 100)
+        
     else:
         system  = "/no_think"
         content = [{"type": "text", "text": prompt},
