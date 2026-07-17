@@ -22,7 +22,7 @@ import numpy as np
 API_URL = "http://127.0.0.1:1234/v1/chat/completions"
 DEFAULT_PROMPT = "Output exactly 10 keywords describing the image.\nComma separated. Stop after 10."
 MAX_CONCURRENT = 3
-MAX_IMAGE_SIZE = 3500
+MAX_IMAGE_SIZE = 3072
 
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.tiff', '.webp', '.bmp')
 VIDEO_EXTENSIONS = ('.mp4', '.webm', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.ts')
@@ -58,7 +58,7 @@ def is_good_frame(frame, blur_threshold=50.0, dark_threshold=20):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return gray.mean() >= dark_threshold and cv2.Laplacian(gray, cv2.CV_64F).var() >= blur_threshold
 
-def extract_video_frames(path, num_frames=4, max_side=960):
+def extract_video_frames(path, num_frames=6, max_side=960, samples_per_bucket=5):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         return None, None, f"Cannot open video container: {os.path.basename(path)}"
@@ -69,20 +69,31 @@ def extract_video_frames(path, num_frames=4, max_side=960):
         cap.release()
         return None, None, "Video file reports 0 frames."
     duration = frame_count / fps
-
-    # First Pass: Sample candidates with strict blur/darkness filters
-    candidates = np.linspace(0, duration, num_frames * 4, endpoint=False)
+ 
+    bucket_size = duration / num_frames
     good_frames, good_ts = [], []
-    for t in candidates:
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        if not is_good_frame(frame):
-            continue
-        good_frames.append(frame)
-        good_ts.append(cap.get(cv2.CAP_PROP_POS_MSEC) / 1000)
-
+    for i in range(num_frames):
+        b_start = i * bucket_size
+        b_end   = b_start + bucket_size
+        candidates = np.linspace(b_start, b_end, samples_per_bucket, endpoint=False)
+ 
+        best_frame, best_ts, best_score = None, None, -1.0
+        for t in candidates:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if gray.mean() < 15:  # only reject near-black frames outright
+                continue
+            score = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if score > best_score:
+                best_frame, best_ts, best_score = frame, cap.get(cv2.CAP_PROP_POS_MSEC) / 1000, score
+ 
+        if best_frame is not None:
+            good_frames.append(best_frame)
+            good_ts.append(best_ts)
+ 
     # Second Pass: Fallback if everything was filtered out or seeking failed
     if not good_frames:
         good_frames, good_ts = [], []
@@ -96,18 +107,18 @@ def extract_video_frames(path, num_frames=4, max_side=960):
                 continue
             good_frames.append(frame)
             good_ts.append(target_frame / fps)
-
+ 
     cap.release()
-
+ 
     if not good_frames:
         return None, None, "Extraction engine failed to read any valid frame data"
-
+ 
     # Evenly subsample down to num_frames if we have extra
     if len(good_frames) > num_frames:
         indices = np.linspace(0, len(good_frames) - 1, num_frames, dtype=int)
         good_frames = [good_frames[i] for i in indices]
         good_ts     = [good_ts[i]     for i in indices]
-
+ 
     # Apply resizing only to the final selected frames
     resized_frames = []
     for frame in good_frames:
@@ -117,7 +128,7 @@ def extract_video_frames(path, num_frames=4, max_side=960):
             frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
         resized_frames.append(frame)
     good_frames = resized_frames
-
+ 
     return good_frames, {"duration": duration, "timestamps": good_ts, "fps": fps}, None
 
 def format_timestamp(s):
@@ -178,17 +189,17 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
             frames = [f"F{i+1}({format_timestamp(t)})" for i, t in enumerate(info['timestamps'])]
             system = "You are a video tagging tool. Respond only with comma-separated keywords."
             text   = (f"These video frames were captured at: {', '.join(frames)}\n\n"
-                    "Analyze the frames and output exactly 10 keywords describing "
-                    "the main actions, subjects, and setting.\n"
-                    "Your output:")
+                    "List 9 keywords for the main recurring subject, action, setting."
+                    "Prioritize what appears across multiple frames, but always include "
+                    "any readable on-screen text, titles, or names even if seen in only one frame.")
             content = [{"type": "text", "text": text}] + \
-                    [{"type": "image_url", "image_url": {"url": d, "detail": "high"}}
+                    [{"type": "image_url", "image_url": {"url": d, "detail": "auto"}}
                     for d in prepared.base64_data]
             effective_max_tokens = max(max_tokens, 100)
     else:
         system  = "/no_think"
         content = [{"type": "text", "text": prompt},
-                   {"type": "image_url", "image_url": {"url": prepared.base64_data, "detail": "high"}}]
+                   {"type": "image_url", "image_url": {"url": prepared.base64_data, "detail": "auto"}}]
         effective_max_tokens = max_tokens
 
     payload = {
