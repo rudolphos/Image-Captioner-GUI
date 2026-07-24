@@ -1,4 +1,5 @@
 import os
+import sys
 from os import path
 import re
 import threading
@@ -9,8 +10,8 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import time
 import cv2
 import requests
-from PIL import Image, PngImagePlugin
-import piexif
+from PIL import Image
+import pyexiv2
 import tkinter as tk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 from tkinter import messagebox, ttk, scrolledtext
@@ -18,6 +19,8 @@ from io import BytesIO
 from dataclasses import dataclass
 from typing import Optional, Any
 import numpy as np
+import ctypes
+from ctypes import wintypes
 
 API_URL = "http://127.0.0.1:1234/v1/chat/completions"
 DEFAULT_PROMPT = "Output exactly 10 keywords describing the image.\nComma separated. Stop after 10."
@@ -38,6 +41,45 @@ adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_CONCURRENT * 2,
                                         max_retries=0)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
+
+def preserve_timestamps(filepath, st_atime, st_mtime, st_ctime):
+    """
+    Restores the original Access Time, Modification Time (Date Modified),
+    and Creation Time (Date Created) of a file.
+    """
+    # 1. Restore Access Time and Modification Time (Cross-platform)
+    try:
+        os.utime(filepath, (st_atime, st_mtime))
+    except Exception as e:
+        print(f"Error restoring atime/mtime for {os.path.basename(filepath)}: {e}")
+
+    # 2. Restore Creation Time (Windows st_ctime)
+    if sys.platform == 'win32' and st_ctime is not None:
+        try:
+            # Convert POSIX timestamp to Windows FILETIME
+            filetime_val = int((st_ctime + 11644473600) * 10000000)
+            low = filetime_val & 0xFFFFFFFF
+            high = (filetime_val >> 32) & 0xFFFFFFFF
+            filetime = wintypes.FILETIME(low, high)
+
+            FILE_WRITE_ATTRIBUTES = 0x0100
+            OPEN_EXISTING = 3
+            FILE_SHARE_READ = 1 | 2 | 4  # READ, WRITE, DELETE
+
+            handle = ctypes.windll.kernel32.CreateFileW(
+                filepath,
+                FILE_WRITE_ATTRIBUTES,
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                0,
+                None
+            )
+            if handle and handle != -1 and handle != 0:
+                ctypes.windll.kernel32.SetFileTime(handle, ctypes.byref(filetime), None, None)
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception as e:
+            print(f"Error restoring creation time for {os.path.basename(filepath)}: {e}")
 
 def encode_image(source, max_size=MAX_IMAGE_SIZE):
     opened = Image.open(source) if isinstance(source, (str, os.PathLike)) else None
@@ -79,7 +121,7 @@ def extract_video_frames(path, num_frames=6, max_side=960, samples_per_bucket=5)
             if not ok:
                 continue
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            if gray.mean() < 15:  # only reject near-black frames outright
+            if gray.mean() < 15:
                 continue
             score = cv2.Laplacian(gray, cv2.CV_64F).var()
             if score > best_score:
@@ -89,10 +131,8 @@ def extract_video_frames(path, num_frames=6, max_side=960, samples_per_bucket=5)
             good_frames.append(best_frame)
             good_ts.append(best_ts)
  
-    # Second Pass: Fallback if everything was filtered out or seeking failed
     if not good_frames:
         good_frames, good_ts = [], []
-        # Calculate index intervals to step through sequentially (safest for VFR webm)
         step = max(1, frame_count // num_frames)
         for i in range(num_frames):
             target_frame = i * step
@@ -108,7 +148,6 @@ def extract_video_frames(path, num_frames=6, max_side=960, samples_per_bucket=5)
     if not good_frames:
         return None, None, "Extraction engine failed to read any valid frame data"
  
-    # Evenly subsample down to num_frames if we have extra
     if len(good_frames) > num_frames:
         indices = np.linspace(0, len(good_frames) - 1, num_frames, dtype=int)
         good_frames = [good_frames[i] for i in indices]
@@ -253,6 +292,16 @@ def clean_caption_for_filename(text, max_length):
 def apply_rename(path, caption, mode):
     if mode == "none" or not caption:
         return path, None
+
+    st_atime, st_mtime, st_ctime = None, None, None
+    try:
+        stats = os.stat(path)
+        st_atime = stats.st_atime
+        st_mtime = stats.st_mtime
+        st_ctime = getattr(stats, 'st_ctime', None)
+    except Exception:
+        pass
+
     dirname  = os.path.dirname(path)
     stem, ext = os.path.splitext(os.path.basename(path))
     clean    = clean_caption_for_filename(caption, 200)
@@ -270,44 +319,65 @@ def apply_rename(path, caption, mode):
                 break
     try:
         os.rename(path, new_path)
+        if st_mtime is not None:
+            preserve_timestamps(new_path, st_atime, st_mtime, st_ctime)
         return new_path, None
     except OSError as e:
         return path, f"{os.path.basename(path)}: {e}"
 
 def apply_metadata(path, caption):
-    if not path.lower().endswith(('.png', '.jpg', '.jpeg')):
+    if not path.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.tiff', '.bmp')):
         return
+
+    st_atime, st_mtime, st_ctime = None, None, None
     try:
         stats = os.stat(path)
-        tmp_path = path + ".tmp"
-        with Image.open(path) as img:
-            img.load()  # force full pixel read before we write anywhere
-            if img.format == 'PNG':
-                info = PngImagePlugin.PngInfo()
-                for k, v in img.info.items():
-                    if isinstance(k, str) and isinstance(v, str):
-                        info.add_text(k, v)
-                info.add_text("Comment", caption)
-                info.add_text("Description", caption)
-                img.save(tmp_path, pnginfo=info)
-            elif img.format in ('JPEG', 'JPEG2000'):
-                exif = {'0th': {}, 'Exif': {}, 'GPS': {}, '1st': {}, 'thumbnail': None}
-                try:
-                    if 'exif' in img.info:
-                        exif = piexif.load(img.info['exif'])
-                except Exception:
-                    pass
-                exif['0th'][piexif.ImageIFD.ImageDescription] = caption.encode('utf-8')
-                try:
-                    img.save(tmp_path, exif=piexif.dump(exif), quality="keep")
-                except Exception:
-                    img.save(tmp_path, quality="keep")
-            else:
-                return  # unsupported format, nothing written, tmp_path never created
-        os.replace(tmp_path, path)
-        os.utime(path, (stats.st_atime, stats.st_mtime))
-    except Exception:
-        pass
+        st_atime = stats.st_atime
+        st_mtime = stats.st_mtime
+        st_ctime = getattr(stats, 'st_ctime', None)
+    except Exception as e:
+        print(f"Could not read stats for {path}: {e}")
+        return
+
+    try:
+        # Read file bytes using Python's Unicode-compliant file reader
+        with open(path, 'rb') as f:
+            data = f.read()
+
+        # Modify metadata in memory using pyexiv2.ImageData (bypasses OS path encoding)
+        img = pyexiv2.ImageData(data)
+        try:
+            # 1. EXIF Metadata
+            img.modify_exif({
+                'Exif.Image.ImageDescription': caption,
+                'Exif.Photo.UserComment': caption,
+            })
+            
+            # 2. IPTC Metadata
+            img.modify_iptc({
+                'Iptc.Application2.Caption': caption,
+                'Iptc.Application2.ObjectName': caption,
+            })
+            
+            # 3. XMP Metadata
+            img.modify_xmp({
+                'Xmp.dc.description': {'lang="x-default"': caption},
+                'Xmp.dc.title': {'lang="x-default"': caption},
+            })
+
+            new_data = img.get_bytes()
+        finally:
+            img.close()
+
+        # Write modified bytes back to disk
+        with open(path, 'wb') as f:
+            f.write(new_data)
+
+    except Exception as e:
+        print(f"Error applying metadata to {os.path.basename(path)} with pyexiv2: {e}")
+    finally:
+        if st_mtime is not None:
+            preserve_timestamps(path, st_atime, st_mtime, st_ctime)
 
 def parse_drop_paths(event):
     try:
@@ -322,10 +392,12 @@ def process_files(file_paths, prompt, rename_mode, metadata_var, api_url,
                   message_label, result_label, progress_bar,
                   token_var, temperature_var, top_p_var):
 
-    # snapshot on main thread — Tk vars shouldn't be read from worker threads
-    max_tokens  = token_var.get()
-    temperature = temperature_var.get()
-    top_p       = top_p_var.get()
+    # Snapshot UI values on the main thread
+    max_tokens   = token_var.get()
+    temperature  = temperature_var.get()
+    top_p        = top_p_var.get()
+    mode         = rename_mode.get()
+    write_meta   = metadata_var.get()
 
     def gui(fn): root.after(0, fn)
     def set_result(text):
@@ -344,7 +416,6 @@ def process_files(file_paths, prompt, rename_mode, metadata_var, api_url,
             rename_errors = []
             in_q  = Queue()
             out_q = Queue(maxsize=MAX_CONCURRENT * 3)
-            has_video = any(fp.lower().endswith(VIDEO_EXTENSIONS) for fp in file_paths)
             effective_concurrent = MAX_CONCURRENT
             video_sem = threading.Semaphore(1)
 
@@ -391,13 +462,12 @@ def process_files(file_paths, prompt, rename_mode, metadata_var, api_url,
                         set_result(f"[{completed}] {caption}")
 
                         new_path = fp
-                        mode = rename_mode.get()
                         if mode in ("append", "replace"):
                             new_path, rerr = apply_rename(fp, caption, mode)
                             if rerr:
                                 rename_errors.append(rerr)
 
-                        if metadata_var.get() and os.path.exists(new_path):
+                        if write_meta and os.path.exists(new_path):
                             apply_metadata(new_path, caption)
 
             for t in prep_threads: t.join()
@@ -431,7 +501,7 @@ def on_drop(event):
                   message_label, result_label, progress_bar,
                   token_var, temperature_var, top_p_var)
 
-#  GUI
+# GUI
 root = TkinterDnD.Tk()
 root.title("LLM Visual Captioner")
 root.geometry("420x700")
@@ -458,7 +528,7 @@ rename_row.pack(fill="x", pady=(2, 0))
 tk.Label(rename_row, text="Rename:").pack(side="left")
 for txt, val in [("Append", "append"), ("Replace", "replace"), ("None", "none")]:
     tk.Radiobutton(rename_row, text=txt, variable=rename_mode, value=val).pack(side="left")
-tk.Checkbutton(opt_frame, text="Write metadata (PNG/JPG EXIF)", variable=metadata_var).pack(anchor="w")
+tk.Checkbutton(opt_frame, text="Write metadata (pyexiv2)", variable=metadata_var).pack(anchor="w")
 
 # Sliders
 token_var       = tk.IntVar(value=32)
@@ -496,7 +566,7 @@ prompt_text = scrolledtext.ScrolledText(prompt_frame, height=4)
 prompt_text.insert("1.0", DEFAULT_PROMPT)
 prompt_text.pack(fill="x")
 
-# Status bar first
+# Status bar
 message_label = tk.Label(frame, text="Ready")
 message_label.pack(fill="x")
 
