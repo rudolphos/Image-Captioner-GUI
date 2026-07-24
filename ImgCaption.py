@@ -39,10 +39,9 @@ adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_CONCURRENT * 2,
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
-# ── Encoding
-
 def encode_image(source, max_size=MAX_IMAGE_SIZE):
-    img = Image.open(source) if isinstance(source, (str, os.PathLike)) else source
+    opened = Image.open(source) if isinstance(source, (str, os.PathLike)) else None
+    img = opened if opened is not None else source
     if max(img.size) > max_size:
         r = max_size / max(img.size)
         img = img.resize((int(img.width * r), int(img.height * r)), Image.Resampling.BICUBIC)
@@ -50,13 +49,9 @@ def encode_image(source, max_size=MAX_IMAGE_SIZE):
         img = img.convert('RGB')
     buf = BytesIO()
     img.save(buf, format="JPEG", quality=75)
-    if isinstance(source, str):
-        img.close()
+    if opened is not None:
+        opened.close()
     return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
-
-def is_good_frame(frame, blur_threshold=50.0, dark_threshold=20):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    return gray.mean() >= dark_threshold and cv2.Laplacian(gray, cv2.CV_64F).var() >= blur_threshold
 
 def extract_video_frames(path, num_frames=6, max_side=960, samples_per_bucket=5):
     cap = cv2.VideoCapture(path)
@@ -119,7 +114,6 @@ def extract_video_frames(path, num_frames=6, max_side=960, samples_per_bucket=5)
         good_frames = [good_frames[i] for i in indices]
         good_ts     = [good_ts[i]     for i in indices]
  
-    # Apply resizing only to the final selected frames
     resized_frames = []
     for frame in good_frames:
         h, w  = frame.shape[:2]
@@ -135,8 +129,6 @@ def format_timestamp(s):
     h, m = int(s // 3600), int((s % 3600) // 60)
     return f"{h}:{m:02d}:{int(s%60):02d}" if h else f"{m}:{int(s%60):02d}"
 
-# ── PreparedImage
-
 @dataclass(slots=True)
 class PreparedImage:
     file_path: str
@@ -146,8 +138,6 @@ class PreparedImage:
 
     def cleanup(self):
         self.base64_data = None
-
-# ── Preprocessing pipeline
 
 def preprocessing_worker(in_q, out_q):
     while True:
@@ -177,9 +167,14 @@ def preprocessing_worker(in_q, out_q):
         finally:
             in_q.task_done()
 
-# ── Caption generation
+def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, video_sem=None, max_retries=2):
+    is_video = isinstance(prepared.base64_data, list)
+    if is_video and video_sem is not None:
+        with video_sem:
+            return _generate_caption_inner(prepared, prompt, api_url, max_tokens, temperature, top_p, max_retries)
+    return _generate_caption_inner(prepared, prompt, api_url, max_tokens, temperature, top_p, max_retries)
 
-def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, max_retries=2):
+def _generate_caption_inner(prepared, prompt, api_url, max_tokens, temperature, top_p, max_retries=2):
     if not prepared.base64_data:
         return None, getattr(prepared, 'error_msg', "Failed to prepare image")
 
@@ -197,7 +192,7 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
             "Prioritize what appears across multiple frames, but always include "
             "any readable on-screen text, titles, or names even if seen in only one frame."})
         effective_max_tokens = max(max_tokens, 100)
-        
+
     else:
         system  = "/no_think"
         content = [{"type": "text", "text": prompt},
@@ -227,7 +222,6 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
             result = resp.json()
             if result.get('choices'):
                 raw = result['choices'][0]['message']['content'].strip()
-                # Strip trailing truncated keyword after last comma
                 if "," in raw:
                     last = raw.rfind(",")
                     after = raw[last + 1:].strip()
@@ -243,8 +237,6 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
         finally:
             if resp:
                 resp.close()
-
-# ── File operations
 
 def clean_caption_for_filename(text, max_length):
     text = FILENAME_CLEAN.sub('', str(text)).strip()
@@ -287,7 +279,9 @@ def apply_metadata(path, caption):
         return
     try:
         stats = os.stat(path)
+        tmp_path = path + ".tmp"
         with Image.open(path) as img:
+            img.load()  # force full pixel read before we write anywhere
             if img.format == 'PNG':
                 info = PngImagePlugin.PngInfo()
                 for k, v in img.info.items():
@@ -295,7 +289,7 @@ def apply_metadata(path, caption):
                         info.add_text(k, v)
                 info.add_text("Comment", caption)
                 info.add_text("Description", caption)
-                img.save(path, pnginfo=info)
+                img.save(tmp_path, pnginfo=info)
             elif img.format in ('JPEG', 'JPEG2000'):
                 exif = {'0th': {}, 'Exif': {}, 'GPS': {}, '1st': {}, 'thumbnail': None}
                 try:
@@ -305,14 +299,15 @@ def apply_metadata(path, caption):
                     pass
                 exif['0th'][piexif.ImageIFD.ImageDescription] = caption.encode('utf-8')
                 try:
-                    img.save(path, exif=piexif.dump(exif), quality="keep")
+                    img.save(tmp_path, exif=piexif.dump(exif), quality="keep")
                 except Exception:
-                    img.save(path, quality="keep")
+                    img.save(tmp_path, quality="keep")
+            else:
+                return  # unsupported format, nothing written, tmp_path never created
+        os.replace(tmp_path, path)
         os.utime(path, (stats.st_atime, stats.st_mtime))
     except Exception:
         pass
-
-# ── Drop path parsing 
 
 def parse_drop_paths(event):
     try:
@@ -323,11 +318,14 @@ def parse_drop_paths(event):
             return re.findall(r'\{([^}]+)\}', data)
         return [p.strip() for p in re.split(r'\s+(?=[A-Za-z]:[\\/])', data) if p.strip()]
 
-# ── Processing───
-
 def process_files(file_paths, prompt, rename_mode, metadata_var, api_url,
                   message_label, result_label, progress_bar,
                   token_var, temperature_var, top_p_var):
+
+    # snapshot on main thread — Tk vars shouldn't be read from worker threads
+    max_tokens  = token_var.get()
+    temperature = temperature_var.get()
+    top_p       = top_p_var.get()
 
     def gui(fn): root.after(0, fn)
     def set_result(text):
@@ -343,73 +341,74 @@ def process_files(file_paths, prompt, rename_mode, metadata_var, api_url,
     total = len(file_paths)
 
     def worker():
-        rename_errors = []
-        in_q  = Queue()
-        out_q = Queue(maxsize=MAX_CONCURRENT * 3)
-        has_video = any(fp.lower().endswith(VIDEO_EXTENSIONS) for fp in file_paths)
-        effective_concurrent = 1 if has_video else MAX_CONCURRENT
+            rename_errors = []
+            in_q  = Queue()
+            out_q = Queue(maxsize=MAX_CONCURRENT * 3)
+            has_video = any(fp.lower().endswith(VIDEO_EXTENSIONS) for fp in file_paths)
+            effective_concurrent = MAX_CONCURRENT
+            video_sem = threading.Semaphore(1)
 
-        prep_threads = [threading.Thread(target=preprocessing_worker, args=(in_q, out_q), daemon=True)
-                        for _ in range(MAX_CONCURRENT)]
-        for t in prep_threads: t.start()
-        for fp in file_paths:  in_q.put(fp)
-        for _  in prep_threads: in_q.put(None)
+            prep_threads = [threading.Thread(target=preprocessing_worker, args=(in_q, out_q), daemon=True)
+                            for _ in range(MAX_CONCURRENT)]
+            for t in prep_threads: t.start()
+            for fp in file_paths:  in_q.put(fp)
+            for _  in prep_threads: in_q.put(None)
 
-        completed = 0
-        with ThreadPoolExecutor(max_workers=effective_concurrent) as ex:
-            pending, submitted = {}, 0
-            for _ in range(min(effective_concurrent, total)):
-                p = out_q.get()
-                fut = ex.submit(generate_caption, p, prompt, api_url,
-                                token_var.get(), temperature_var.get(), top_p_var.get())
-                pending[fut] = p
-                submitted += 1
+            completed = 0
+            with ThreadPoolExecutor(max_workers=effective_concurrent) as ex:
+                pending, submitted = {}, 0
+                for _ in range(min(effective_concurrent, total)):
+                    p = out_q.get()
+                    fut = ex.submit(generate_caption, p, prompt, api_url,
+                                    max_tokens, temperature, top_p, video_sem)
+                    pending[fut] = p
+                    submitted += 1
 
-            while pending:
-                done, _ = wait(pending, return_when=FIRST_COMPLETED)
-                for fut in done:
-                    prep     = pending.pop(fut)
-                    fp       = prep.file_path
-                    caption, err = fut.result()
-                    prep.cleanup()
-                    completed += 1
+                while pending:
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        prep     = pending.pop(fut)
+                        fp       = prep.file_path
+                        caption, err = fut.result()
+                        prep.cleanup()
+                        completed += 1
 
-                    if submitted < total:
-                        p = out_q.get()
-                        nf = ex.submit(generate_caption, p, prompt, api_url,
-                                       token_var.get(), temperature_var.get(), top_p_var.get())
-                        pending[nf] = p
-                        submitted += 1
+                        if submitted < total:
+                            p = out_q.get()
+                            nf = ex.submit(generate_caption, p, prompt, api_url,
+                                           max_tokens, temperature, top_p, video_sem)
+                            pending[nf] = p
+                            submitted += 1
 
-                    gui(lambda c=completed, n=os.path.basename(fp):
-                        message_label.config(text=f"Processing {c}/{total}\n{n}"))
-                    gui(lambda v=completed: progress_bar.config(value=v))
+                        gui(lambda c=completed, n=os.path.basename(fp):
+                            message_label.config(text=f"Processing {c}/{total}\n{n}"))
+                        gui(lambda v=completed: progress_bar.config(value=v))
 
-                    if err or not caption:
-                        set_result(f"[{completed}] Failed: {os.path.basename(fp)}\n{err}")
-                        continue
+                        if err or not caption:
+                            set_result(f"[{completed}] Failed: {os.path.basename(fp)}\n{err}")
+                            continue
 
-                    set_result(f"[{completed}] {caption}")
+                        set_result(f"[{completed}] {caption}")
 
-                    new_path = fp
-                    mode = rename_mode.get()
-                    if mode in ("append", "replace"):
-                        new_path, rerr = apply_rename(fp, caption, mode)
-                        if rerr:
-                            rename_errors.append(rerr)
+                        new_path = fp
+                        mode = rename_mode.get()
+                        if mode in ("append", "replace"):
+                            new_path, rerr = apply_rename(fp, caption, mode)
+                            if rerr:
+                                rename_errors.append(rerr)
 
-                    if metadata_var.get() and os.path.exists(new_path):
-                        apply_metadata(new_path, caption)
+                        if metadata_var.get() and os.path.exists(new_path):
+                            apply_metadata(new_path, caption)
 
-        for t in prep_threads: t.join()
+            for t in prep_threads: t.join()
 
-        if rename_errors:
-            msg = "\n".join(rename_errors)
-            gui(lambda m=msg: messagebox.showwarning("Rename Errors", m))
+            if rename_errors:
+                msg = "\n".join(rename_errors)
+                gui(lambda m=msg: messagebox.showwarning("Rename Errors", m))
 
-        summary = f"✓ Complete: {total} files" + (f" ({len(rename_errors)} rename errors)" if rename_errors else "")
-        gui(lambda s=summary: message_label.config(text=s))
-        gui(lambda: progress_bar.config(value=0))
+            summary = f"✓ Complete: {total} files" + (f" ({len(rename_errors)} rename errors)" if rename_errors else "")
+            gui(lambda s=summary: message_label.config(text=s))
+            gui(lambda: progress_bar.config(value=0))
 
     threading.Thread(target=worker, daemon=True).start()
 
