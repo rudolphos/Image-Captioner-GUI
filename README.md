@@ -7,7 +7,7 @@ Drag your files in, let the LLM analyze them, and it automatically saves the res
 - Captions images (.jpg, .png) and videos (.mp4, .mkv, etc.).
 - Extracts video frames and sends them to the AI to describe temporal progression and action.
 - Append keywords to existing file names or replace entirely (in case filename contains randomness or gibberish). It automatically handles illegal characters and file path lengths.
-- Can write captions into the metadata of JPEG (EXIF) and PNG files (ImageDescription/Comment tags).
+- Can write captions into the metadata of JPEG (EXIF, IPTC, XMP) and PNG files (ImageDescription/Comment tags).
 - Uses concurrent threading and a preprocessing of the next image so GPU stays saturated while the CPU handles file I/O.
 - Drag & Drop priority - No CLI needed — just drop selected files onto the GUI.
 
@@ -35,5 +35,5 @@ For video analysis there is one basic prompt inside the script already that you 
 ## Requirements
 Python 3.10+
 ```bash
-pip install opencv-python Pillow piexif requests tkinterdnd2-universal numpy
+pip install opencv-python Pillow pyexiv2 requests tkinterdnd2-universal numpy
 ```
