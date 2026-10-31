@@ -5,7 +5,7 @@ import re
 import threading
 import base64
 from functools import lru_cache
-from queue import Queue
+from queue import Queue, Empty
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import time
 import cv2
@@ -31,7 +31,7 @@ IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.tiff', '.webp', '.bmp')
 VIDEO_EXTENSIONS = ('.mp4', '.webm', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.ts')
 ALL_EXTENSIONS   = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
 
-FILENAME_CLEAN   = re.compile(r'^(?:photograph|photo|image|picture|shot|view|讽刺)(?:\s+of)?(?:\s+(?:a|an|the))?\s+|^(?:a|an|the)\s+', re.IGNORECASE)
+FILENAME_CLEAN   = re.compile(r'^(?:photograph|photo|image|picture|shot|view)(?:\s+of)?(?:\s+(?:a|an|the))?\s+|^(?:a|an|the)\s+', re.IGNORECASE)
 FILENAME_INVALID = re.compile(r'[<>:"/\\|?*\.;!\']')
 FILENAME_SPACES  = re.compile(r'\s+')
 
@@ -41,6 +41,21 @@ adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_CONCURRENT * 2,
                                         max_retries=0)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
+
+if sys.platform == 'win32':
+    _kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    _kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                      wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                                      wintypes.HANDLE]
+    _kernel32.CreateFileW.restype = wintypes.HANDLE
+    _kernel32.SetFileTime.argtypes = [wintypes.HANDLE,
+                                      ctypes.POINTER(wintypes.FILETIME),
+                                      ctypes.POINTER(wintypes.FILETIME),
+                                      ctypes.POINTER(wintypes.FILETIME)]
+    _kernel32.SetFileTime.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 def preserve_timestamps(filepath, st_atime, st_mtime, st_ctime):
     """
@@ -64,20 +79,22 @@ def preserve_timestamps(filepath, st_atime, st_mtime, st_ctime):
 
             FILE_WRITE_ATTRIBUTES = 0x0100
             OPEN_EXISTING = 3
-            FILE_SHARE_READ = 1 | 2 | 4  # READ, WRITE, DELETE
+            FILE_SHARE_ALL = 1 | 2 | 4  # READ, WRITE, DELETE
 
-            handle = ctypes.windll.kernel32.CreateFileW(
+            handle = _kernel32.CreateFileW(
                 filepath,
                 FILE_WRITE_ATTRIBUTES,
-                FILE_SHARE_READ,
+                FILE_SHARE_ALL,
                 None,
                 OPEN_EXISTING,
                 0,
                 None
             )
-            if handle and handle != -1 and handle != 0:
-                ctypes.windll.kernel32.SetFileTime(handle, ctypes.byref(filetime), None, None)
-                ctypes.windll.kernel32.CloseHandle(handle)
+            if handle and handle != INVALID_HANDLE_VALUE:
+                try:
+                    _kernel32.SetFileTime(handle, ctypes.byref(filetime), None, None)
+                finally:
+                    _kernel32.CloseHandle(handle)
         except Exception as e:
             print(f"Error restoring creation time for {os.path.basename(filepath)}: {e}")
 
@@ -200,9 +217,11 @@ def preprocessing_worker(in_q, out_q):
                         out_q.put(PreparedImage(path, None, error_msg="Frame encoding failed"))
                     else:
                         out_q.put(PreparedImage(path, b64_frames, info))
+            else:
+                out_q.put(PreparedImage(path, None, error_msg="Unsupported file type"))
         except Exception as e:
             print(f"Preprocessing error {path}: {e}")
-            out_q.put(PreparedImage(path, None))
+            out_q.put(PreparedImage(path, None, error_msg=f"Preprocessing failed: {e}"))
         finally:
             in_q.task_done()
 
@@ -215,7 +234,7 @@ def generate_caption(prepared, prompt, api_url, max_tokens, temperature, top_p, 
 
 def _generate_caption_inner(prepared, prompt, api_url, max_tokens, temperature, top_p, max_retries=2):
     if not prepared.base64_data:
-        return None, getattr(prepared, 'error_msg', "Failed to prepare image")
+        return None, prepared.error_msg or "Failed to prepare image"
 
     is_video = isinstance(prepared.base64_data, list)
     if is_video:
@@ -276,6 +295,7 @@ def _generate_caption_inner(prepared, prompt, api_url, max_tokens, temperature, 
         finally:
             if resp:
                 resp.close()
+    return None, "Request failed"
 
 def clean_caption_for_filename(text, max_length):
     text = FILENAME_CLEAN.sub('', str(text)).strip()
@@ -327,7 +347,7 @@ def apply_rename(path, caption, mode):
 
 def apply_metadata(path, caption):
     if not path.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.tiff', '.bmp')):
-        return
+        return None
 
     st_atime, st_mtime, st_ctime = None, None, None
     try:
@@ -337,8 +357,9 @@ def apply_metadata(path, caption):
         st_ctime = getattr(stats, 'st_ctime', None)
     except Exception as e:
         print(f"Could not read stats for {path}: {e}")
-        return
+        return f"{os.path.basename(path)}: metadata skipped, cannot read file stats: {e}"
 
+    error = None
     try:
         # Read file bytes using Python's Unicode-compliant file reader
         with open(path, 'rb') as f:
@@ -375,9 +396,11 @@ def apply_metadata(path, caption):
 
     except Exception as e:
         print(f"Error applying metadata to {os.path.basename(path)} with pyexiv2: {e}")
+        error = f"{os.path.basename(path)}: metadata failed: {e}"
     finally:
         if st_mtime is not None:
             preserve_timestamps(path, st_atime, st_mtime, st_ctime)
+    return error
 
 def parse_drop_paths(event):
     try:
@@ -387,6 +410,18 @@ def parse_drop_paths(event):
         if '{' in data:
             return re.findall(r'\{([^}]+)\}', data)
         return [p.strip() for p in re.split(r'\s+(?=[A-Za-z]:[\\/])', data) if p.strip()]
+
+ui_queue = Queue()
+batch_running = threading.Event()
+
+def poll_ui_queue():
+    """Run callables queued by worker threads; Tkinter is only touched from the main thread."""
+    try:
+        while True:
+            ui_queue.get_nowait()()
+    except Empty:
+        pass
+    root.after(50, poll_ui_queue)
 
 def process_files(file_paths, prompt, rename_mode, metadata_var, api_url,
                   message_label, result_label, progress_bar,
@@ -399,7 +434,7 @@ def process_files(file_paths, prompt, rename_mode, metadata_var, api_url,
     mode         = rename_mode.get()
     write_meta   = metadata_var.get()
 
-    def gui(fn): root.after(0, fn)
+    def gui(fn): ui_queue.put(fn)
     def set_result(text):
         def _():
             result_label.config(state='normal')
@@ -413,10 +448,10 @@ def process_files(file_paths, prompt, rename_mode, metadata_var, api_url,
     total = len(file_paths)
 
     def worker():
-            rename_errors = []
+        errors = []
+        try:
             in_q  = Queue()
             out_q = Queue(maxsize=MAX_CONCURRENT * 3)
-            effective_concurrent = MAX_CONCURRENT
             video_sem = threading.Semaphore(1)
 
             prep_threads = [threading.Thread(target=preprocessing_worker, args=(in_q, out_q), daemon=True)
@@ -426,63 +461,81 @@ def process_files(file_paths, prompt, rename_mode, metadata_var, api_url,
             for _  in prep_threads: in_q.put(None)
 
             completed = 0
-            with ThreadPoolExecutor(max_workers=effective_concurrent) as ex:
+            with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as ex:
                 pending, submitted = {}, 0
-                for _ in range(min(effective_concurrent, total)):
+
+                def submit_next():
+                    nonlocal submitted
                     p = out_q.get()
                     fut = ex.submit(generate_caption, p, prompt, api_url,
                                     max_tokens, temperature, top_p, video_sem)
                     pending[fut] = p
                     submitted += 1
 
+                for _ in range(min(MAX_CONCURRENT, total)):
+                    submit_next()
+
                 while pending:
                     done, _ = wait(pending, return_when=FIRST_COMPLETED)
                     for fut in done:
-                        prep     = pending.pop(fut)
-                        fp       = prep.file_path
-                        caption, err = fut.result()
-                        prep.cleanup()
+                        prep = pending.pop(fut)
+                        fp   = prep.file_path
+                        name = os.path.basename(fp)
                         completed += 1
 
                         if submitted < total:
-                            p = out_q.get()
-                            nf = ex.submit(generate_caption, p, prompt, api_url,
-                                           max_tokens, temperature, top_p, video_sem)
-                            pending[nf] = p
-                            submitted += 1
+                            submit_next()
 
-                        gui(lambda c=completed, n=os.path.basename(fp):
+                        gui(lambda c=completed, n=name:
                             message_label.config(text=f"Processing {c}/{total}\n{n}"))
                         gui(lambda v=completed: progress_bar.config(value=v))
 
-                        if err or not caption:
-                            set_result(f"[{completed}] Failed: {os.path.basename(fp)}\n{err}")
-                            continue
+                        try:
+                            caption, err = fut.result()
+                            if err or not caption:
+                                set_result(f"[{completed}] Failed: {name}\n{err or 'Empty caption'}")
+                                continue
 
-                        set_result(f"[{completed}] {caption}")
+                            set_result(f"[{completed}] {caption}")
 
-                        new_path = fp
-                        if mode in ("append", "replace"):
-                            new_path, rerr = apply_rename(fp, caption, mode)
-                            if rerr:
-                                rename_errors.append(rerr)
+                            new_path = fp
+                            if mode in ("append", "replace"):
+                                new_path, rerr = apply_rename(fp, caption, mode)
+                                if rerr:
+                                    errors.append(rerr)
 
-                        if write_meta and os.path.exists(new_path):
-                            apply_metadata(new_path, caption)
+                            if write_meta and os.path.exists(new_path):
+                                merr = apply_metadata(new_path, caption)
+                                if merr:
+                                    errors.append(merr)
+                        except Exception as e:
+                            print(f"Error processing {fp}: {e}")
+                            errors.append(f"{name}: {e}")
+                            set_result(f"[{completed}] Failed: {name}\n{e}")
+                        finally:
+                            prep.cleanup()
 
             for t in prep_threads: t.join()
 
-            if rename_errors:
-                msg = "\n".join(rename_errors)
-                gui(lambda m=msg: messagebox.showwarning("Rename Errors", m))
+            if errors:
+                msg = "\n".join(errors)
+                gui(lambda m=msg: messagebox.showwarning("Errors", m))
 
-            summary = f"✓ Complete: {total} files" + (f" ({len(rename_errors)} rename errors)" if rename_errors else "")
+            summary = f"✓ Complete: {total} files" + (f" ({len(errors)} errors)" if errors else "")
             gui(lambda s=summary: message_label.config(text=s))
+        except Exception as e:
+            print(f"Batch failed: {e}")
+            gui(lambda m=str(e): message_label.config(text=f"Batch failed: {m}"))
+        finally:
             gui(lambda: progress_bar.config(value=0))
+            batch_running.clear()
 
     threading.Thread(target=worker, daemon=True).start()
 
 def on_drop(event):
+    if batch_running.is_set():
+        messagebox.showinfo("Busy", "A batch is still running. Wait for it to finish.")
+        return
     seen, file_paths = set(), []
     for p in parse_drop_paths(event):
         p = os.path.normpath(re.sub(r'^file:/+', '', p.strip('"')))
@@ -494,12 +547,17 @@ def on_drop(event):
     if not file_paths:
         messagebox.showwarning("No valid files", "No supported image/video files detected.")
         return
-    process_files(file_paths,
-                  prompt_text.get("1.0", tk.END).strip() or DEFAULT_PROMPT,
-                  rename_mode, metadata_var,
-                  api_url_entry.get().strip() or API_URL,
-                  message_label, result_label, progress_bar,
-                  token_var, temperature_var, top_p_var)
+    batch_running.set()
+    try:
+        process_files(file_paths,
+                      prompt_text.get("1.0", tk.END).strip() or DEFAULT_PROMPT,
+                      rename_mode, metadata_var,
+                      api_url_entry.get().strip() or API_URL,
+                      message_label, result_label, progress_bar,
+                      token_var, temperature_var, top_p_var)
+    except Exception:
+        batch_running.clear()
+        raise
 
 # GUI
 root = TkinterDnD.Tk()
@@ -576,4 +634,5 @@ result_frame.pack(fill="both", expand=True, pady=2)
 result_label = scrolledtext.ScrolledText(result_frame, state="disabled")
 result_label.pack(fill="both", expand=True)
 
+poll_ui_queue()
 root.mainloop()
